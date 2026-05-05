@@ -3636,6 +3636,82 @@ button{
   }
 }
 
+
+/* FIREBASE AUTH + CLOUD SYNC PATCH */
+.firebase-auth-box{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  flex-wrap:nowrap;
+  min-width:0;
+}
+.cloud-status{
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+  max-width:210px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  border:1px solid var(--line);
+  background:var(--panel2);
+  color:var(--muted);
+  border-radius:999px;
+  padding:6px 9px;
+  font-family:var(--mono);
+  font-size:.68rem;
+}
+.cloud-status.cloud-ok{
+  color:var(--green);
+  background:var(--greenBg);
+  border-color:rgba(56,217,150,.35);
+}
+.cloud-status.cloud-warn{
+  color:var(--yellow);
+  background:var(--yellowBg);
+  border-color:rgba(255,212,74,.35);
+}
+.cloud-status.cloud-bad{
+  color:var(--red);
+  background:var(--redBg);
+  border-color:rgba(255,95,109,.35);
+}
+.auth-grid{
+  display:grid;
+  gap:12px;
+}
+.auth-field{
+  display:grid;
+  gap:6px;
+}
+.auth-field label{
+  color:var(--muted);
+  font-size:.85rem;
+}
+.auth-field input{
+  width:100%;
+  background:var(--panel2);
+  color:var(--text);
+  border:1px solid var(--line);
+  border-radius:10px;
+  padding:10px 11px;
+  outline:none;
+}
+.auth-note{
+  color:var(--muted);
+  line-height:1.45;
+  font-size:.88rem;
+}
+.auth-actions{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+}
+@media(max-width:900px){
+  .firebase-auth-box{min-width:max-content;}
+  .cloud-status{max-width:160px;}
+}
+
 </style>
 </head>
 <body>
@@ -3645,6 +3721,7 @@ button{
     <div class="logo">Med School <span>Decision Hub</span></div>
     <nav class="nav" id="nav"></nav>
     <div class="top-actions">
+      <div class="firebase-auth-box" id="firebaseAuthBox"><span class="cloud-status cloud-warn">Local only</span><button class="btn small" onclick="openFirebaseAuthModal()">Login</button></div>
       <button class="btn small" onclick="openThemePanel()">Theme</button>
       <button class="btn small" onclick="exportCSV('all')">CSV</button>
       <button class="btn small" onclick="exportJSON()">JSON</button>
@@ -3692,6 +3769,178 @@ let theme = {...DEFAULT_THEME};
 let activeView = 'dashboard';
 let sortKey = 'fitScore';
 let sortDir = -1;
+
+/* Firebase Auth + Firestore cloud sync */
+let decideMDCloudApi = null;
+let decideMDCloudUser = null;
+let decideMDCloudLoading = false;
+let decideMDCloudSaveTimer = null;
+let decideMDCloudStatusText = 'Local only';
+let decideMDCloudStatusClass = 'cloud-warn';
+
+function setCloudStatus(textValue, className='cloud-warn'){
+  decideMDCloudStatusText = textValue || 'Local only';
+  decideMDCloudStatusClass = className || 'cloud-warn';
+  renderFirebaseAuthBox();
+}
+
+function renderFirebaseAuthBox(){
+  const box = document.getElementById('firebaseAuthBox');
+  if(!box) return;
+  const status = `<span class="cloud-status ${decideMDCloudStatusClass}">${esc(decideMDCloudStatusText)}</span>`;
+  if(decideMDCloudUser){
+    const email = esc(decideMDCloudUser.email || 'Signed in');
+    box.innerHTML = `<span class="cloud-status cloud-ok" title="${email}">Cloud: ${email}</span><button class="btn small" onclick="cloudSyncNow()">Sync</button><button class="btn small" onclick="cloudSignOut()">Logout</button>`;
+  }else{
+    box.innerHTML = `${status}<button class="btn small" onclick="openFirebaseAuthModal()">Login</button>`;
+  }
+}
+
+function openFirebaseAuthModal(){
+  const root = document.getElementById('modalRoot');
+  root.classList.remove('hidden');
+  root.innerHTML = `
+    <div class="modal edit-modal">
+      <div class="modal-head">
+        <div><h2>DecideMD Cloud Login</h2><div class="meta">Use the same email on your laptop and phone so your shortlist, edits, and notes sync.</div></div>
+        <button class="close" onclick="closeFirebaseAuthModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="auth-grid">
+          <div class="auth-note">GitHub Pages still hosts the app. Firebase only handles login and cloud saving. Signed-out changes stay saved locally in this browser.</div>
+          <div class="auth-field"><label>Email</label><input id="firebaseEmail" type="email" autocomplete="email" placeholder="you@example.com"></div>
+          <div class="auth-field"><label>Password</label><input id="firebasePassword" type="password" autocomplete="current-password" placeholder="At least 6 characters"></div>
+          <div class="auth-actions">
+            <button class="btn primary" onclick="cloudSignIn()">Log in</button>
+            <button class="btn" onclick="cloudSignUp()">Create account</button>
+            <button class="btn" onclick="closeFirebaseAuthModal()">Cancel</button>
+          </div>
+          <div class="auth-note" id="firebaseAuthMessage">After login, DecideMD loads your cloud data. If there is no cloud data yet, it uploads your current local data once.</div>
+        </div>
+      </div>
+    </div>`;
+}
+function closeFirebaseAuthModal(){
+  const root = document.getElementById('modalRoot');
+  root.classList.add('hidden');
+  root.innerHTML = '';
+}
+function firebaseAuthInputs(){
+  return {
+    email: (document.getElementById('firebaseEmail')?.value || '').trim(),
+    password: document.getElementById('firebasePassword')?.value || ''
+  };
+}
+function firebaseAuthMessage(msg, bad=false){
+  const el = document.getElementById('firebaseAuthMessage');
+  if(el){ el.textContent = msg; el.style.color = bad ? 'var(--red)' : 'var(--muted)'; }
+}
+async function cloudSignIn(){
+  if(!decideMDCloudApi) return firebaseAuthMessage('Firebase is still loading. Try again in a second.', true);
+  const {email,password} = firebaseAuthInputs();
+  if(!email || !password) return firebaseAuthMessage('Enter your email and password first.', true);
+  try{
+    firebaseAuthMessage('Logging in...');
+    await decideMDCloudApi.signIn(email,password);
+    closeFirebaseAuthModal();
+    toast('Logged in. Loading cloud data.');
+  }catch(err){ firebaseAuthMessage(firebaseNiceError(err), true); }
+}
+async function cloudSignUp(){
+  if(!decideMDCloudApi) return firebaseAuthMessage('Firebase is still loading. Try again in a second.', true);
+  const {email,password} = firebaseAuthInputs();
+  if(!email || !password) return firebaseAuthMessage('Enter an email and password first.', true);
+  if(password.length < 6) return firebaseAuthMessage('Password needs at least 6 characters.', true);
+  try{
+    firebaseAuthMessage('Creating account...');
+    await decideMDCloudApi.signUp(email,password);
+    closeFirebaseAuthModal();
+    toast('Account created. Cloud sync is on.');
+  }catch(err){ firebaseAuthMessage(firebaseNiceError(err), true); }
+}
+async function cloudSignOut(){
+  if(!decideMDCloudApi) return;
+  try{ await decideMDCloudApi.signOut(); toast('Logged out. Saving locally only.'); }
+  catch(err){ toast(firebaseNiceError(err)); }
+}
+async function cloudSyncNow(){
+  if(!decideMDCloudApi || !decideMDCloudUser){ toast('Log in first to sync.'); return; }
+  try{
+    setCloudStatus('Saving to cloud...', 'cloud-warn');
+    const payload = buildStatePayload();
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    await decideMDCloudApi.saveUserData(payload);
+    setCloudStatus('Saved to cloud', 'cloud-ok');
+    toast('Saved to cloud');
+  }catch(err){ setCloudStatus('Cloud save failed', 'cloud-bad'); toast(firebaseNiceError(err)); }
+}
+function firebaseNiceError(err){
+  const code = String(err && err.code || '');
+  if(code.includes('auth/invalid-credential') || code.includes('auth/wrong-password') || code.includes('auth/user-not-found')) return 'That login did not work. Check the email and password.';
+  if(code.includes('auth/email-already-in-use')) return 'That email already has an account. Try logging in instead.';
+  if(code.includes('auth/weak-password')) return 'Password needs at least 6 characters.';
+  if(code.includes('permission-denied')) return 'Firestore blocked the save. Check your Firestore rules.';
+  return (err && err.message) ? err.message : 'Firebase had an error.';
+}
+
+function decideMDOnFirebaseReady(api){
+  decideMDCloudApi = api;
+  setCloudStatus('Not signed in', 'cloud-warn');
+  api.onAuthStateChanged(handleFirebaseAuthState);
+}
+window.decideMDOnFirebaseReady = decideMDOnFirebaseReady;
+
+async function handleFirebaseAuthState(user){
+  decideMDCloudUser = user || null;
+  if(!user){
+    decideMDCloudLoading = false;
+    setCloudStatus('Local only', 'cloud-warn');
+    return;
+  }
+  setCloudStatus('Loading cloud data...', 'cloud-warn');
+  decideMDCloudLoading = true;
+  try{
+    const cloudData = await decideMDCloudApi.loadUserData();
+    if(cloudData){
+      applySavedData(cloudData);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(cloudData));
+      recalcAll();
+      renderActive();
+      setCloudStatus('Saved to cloud', 'cloud-ok');
+      toast('Cloud data loaded');
+    }else{
+      const localData = safeParse(localStorage.getItem(STORAGE_KEY)) || buildStatePayload();
+      await decideMDCloudApi.saveUserData(localData);
+      setCloudStatus('Local data uploaded', 'cloud-ok');
+      toast('Local DecideMD data uploaded to cloud');
+    }
+  }catch(err){
+    setCloudStatus('Cloud load failed', 'cloud-bad');
+    toast(firebaseNiceError(err));
+  }finally{
+    decideMDCloudLoading = false;
+  }
+}
+
+function scheduleCloudSave(payload){
+  if(!decideMDCloudApi || !decideMDCloudUser){
+    setCloudStatus('Saved locally', 'cloud-warn');
+    return;
+  }
+  if(decideMDCloudLoading) return;
+  clearTimeout(decideMDCloudSaveTimer);
+  setCloudStatus('Saving to cloud...', 'cloud-warn');
+  decideMDCloudSaveTimer = setTimeout(async () => {
+    try{
+      await decideMDCloudApi.saveUserData(payload || buildStatePayload());
+      setCloudStatus('Saved to cloud', 'cloud-ok');
+    }catch(err){
+      setCloudStatus('Cloud save failed', 'cloud-bad');
+      console.warn('DecideMD cloud save failed:', err);
+    }
+  }, 900);
+}
+
 
 const COLUMNS = {
   master: [ ['compare','Compare'], ['favorite','Star'], ['quickEliminate','Eliminate'], ['quickInterested','Interested'], ['editRow','Edit'], ['degreeType','Degree'], ['name','School'], ['state','State'], ['city','City'], ['publicPrivate','Type'], ['medianMCAT','MCAT'], ['medianGPA','GPA'], ['oosFriendly','OOS'], ['fitScore','Fit'], ['autoRecommendation','Auto Rec'], ['manualDecision','Decision'], ['finalCategory','Category'], ['dataConfidence','Data'] ],
@@ -3836,34 +4085,36 @@ function applyScreenshotInterestedSchoolsOnce(){
 function init(){
   loadTheme();
   schools = RAW_SCHOOLS.map(s => ({...s}));
-  const saved = safeParse(localStorage.getItem(STORAGE_KEY));
-  if(saved){
-    if(saved.profile) profile = {...profile, ...saved.profile};
-    if(saved.schoolState){
-      const map = saved.schoolState;
-      schools.forEach(s => {
-        if(map[s.id]){
-          const savedSchool = map[s.id] || {};
-          // Preserve personal choices and notes, but do not let old localStorage erase newly imported official/base data.
-          ['favorite','manualDecision','myNotes','whyIFit','whyIMightNotFit','canWriteSecondary','comparisonSelected','manualFinalCategory','eliminationStatus','concernReasons','strengthReasons'].forEach(k => {
-            if(savedSchool[k] !== undefined) s[k] = savedSchool[k];
-          });
-          s.userEditedFields = savedSchool.userEditedFields || {};
-          const editableValues = savedSchool.editableValues || {};
-          Object.keys(editableValues).forEach(k => {
-            if(s.userEditedFields && s.userEditedFields[k]) s[k] = editableValues[k];
-          });
-        }
-      });
-    }
-  }
+  applySavedData(safeParse(localStorage.getItem(STORAGE_KEY)));
   applyScreenshotInterestedSchoolsOnce();
   recalcAll();
   buildNav();
+  renderFirebaseAuthBox();
   showView('dashboard');
 }
 function safeParse(x){ try{ return JSON.parse(x); }catch(e){ return null; } }
-function saveState(){
+function applySavedData(saved){
+  if(!saved) return false;
+  if(saved.profile) profile = {...profile, ...saved.profile};
+  if(saved.schoolState){
+    const map = saved.schoolState;
+    schools.forEach(s => {
+      if(map[s.id]){
+        const savedSchool = map[s.id] || {};
+        ['favorite','manualDecision','myNotes','whyIFit','whyIMightNotFit','canWriteSecondary','comparisonSelected','manualFinalCategory','eliminationStatus','concernReasons','strengthReasons'].forEach(k => {
+          if(savedSchool[k] !== undefined) s[k] = savedSchool[k];
+        });
+        s.userEditedFields = savedSchool.userEditedFields || {};
+        const editableValues = savedSchool.editableValues || {};
+        Object.keys(editableValues).forEach(k => {
+          if(s.userEditedFields && s.userEditedFields[k]) s[k] = editableValues[k];
+        });
+      }
+    });
+  }
+  return true;
+}
+function buildStatePayload(){
   const schoolState = {};
   schools.forEach(s => {
     const editableValues = {};
@@ -3878,12 +4129,21 @@ function saveState(){
       whyIMightNotFit:s.whyIMightNotFit||'',
       canWriteSecondary:s.canWriteSecondary||'Needs personal review',
       comparisonSelected:!!s.comparisonSelected,
+      manualFinalCategory:s.manualFinalCategory||'',
+      eliminationStatus:s.eliminationStatus||'Active',
+      concernReasons:s.concernReasons||[],
+      strengthReasons:s.strengthReasons||[],
       lastUpdated:s.lastUpdated||'',
       userEditedFields:s.userEditedFields||{},
       editableValues
     };
   });
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({profile, schoolState}));
+  return {profile, schoolState, savedAt:new Date().toISOString(), appVersion:'decidemd-cloud-v1'};
+}
+function saveState(){
+  const payload = buildStatePayload();
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+  scheduleCloudSave(payload);
 }
 function normState(v){ return STATE_ALIASES[String(v||'').trim().toLowerCase()] || String(v||'').trim().toUpperCase(); }
 function asNum(v){ return (typeof v === 'number' && isFinite(v) && v>0) ? v : null; }
@@ -5112,5 +5372,67 @@ setInterval(dmAfterRenderPolish, 1200);
 <!-- Filter hide fix applied -->
 
 <!-- Final data import applied 2026-05-04 -->
+<script type="module" id="decidemd-firebase-module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-app.js";
+  import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-auth.js";
+  import { getFirestore, doc, getDoc, setDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyBXwUTGRzfLGNprV54MQFMNsl-JgBthdSs",
+    authDomain: "decidemd-85541.firebaseapp.com",
+    projectId: "decidemd-85541",
+    storageBucket: "decidemd-85541.firebasestorage.app",
+    messagingSenderId: "899219016052",
+    appId: "1:899219016052:web:d68be0105b0105aec0c421",
+    measurementId: "G-SWPL55VY96"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db = getFirestore(app);
+
+  function userDoc(){
+    if(!auth.currentUser) throw new Error('Not signed in');
+    return doc(db, 'users', auth.currentUser.uid, 'apps', 'decidemd');
+  }
+
+  const api = {
+    onAuthStateChanged(callback){
+      return onAuthStateChanged(auth, callback);
+    },
+    signIn(email, password){
+      return signInWithEmailAndPassword(auth, email, password);
+    },
+    signUp(email, password){
+      return createUserWithEmailAndPassword(auth, email, password);
+    },
+    signOut(){
+      return signOut(auth);
+    },
+    async loadUserData(){
+      const snap = await getDoc(userDoc());
+      if(!snap.exists()) return null;
+      const data = snap.data() || {};
+      return data.payload || null;
+    },
+    async saveUserData(payload){
+      await setDoc(userDoc(), {
+        payload,
+        updatedAt: serverTimestamp(),
+        appName: 'DecideMD'
+      }, { merge:true });
+    }
+  };
+
+  window.DecideMDFirebase = api;
+  if(typeof window.decideMDOnFirebaseReady === 'function'){
+    window.decideMDOnFirebaseReady(api);
+  }else{
+    window.addEventListener('DOMContentLoaded', () => {
+      if(typeof window.decideMDOnFirebaseReady === 'function') window.decideMDOnFirebaseReady(api);
+    });
+  }
+</script>
+
 </body>
 </html>
